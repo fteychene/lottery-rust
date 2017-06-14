@@ -1,0 +1,9 @@
+[package]
+name = "jug-lottery"
+version = "0.1.0"
+authors = ["fteychene <francois.teychene@gmail.com>"]
+
+[dependencies]
+rustc-serialize = "0.3.24"
+hyper = "~0.10"
+hyper-native-tls = "0.2.4"
