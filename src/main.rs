@@ -229,5 +229,5 @@ fn main() {
     let mut router = Router::new();
     router.get("/winners", winners, "query");
 
-    Iron::new(router).http("localhost:3000").unwrap();
+    Iron::new(router).http("0.0.0.0:3000").unwrap();
 }
