@@ -1,4 +1,5 @@
 #![feature(drop_types_in_const)]
+#![feature(box_patterns)]
 extern crate hyper;
 extern crate hyper_native_tls;
 extern crate rustc_serialize;
@@ -6,6 +7,8 @@ extern crate rand;
 extern crate iron;
 extern crate router;
 extern crate urlencoded;
+#[macro_use] extern crate log;
+extern crate env_logger;
 
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -32,22 +35,27 @@ use std::mem;
 #[derive(Debug)]
 enum LotteryError {
     NoEventAvailable,
-    BadParameter(iron::status::Status, String)
+    TechnicalError(Box<Error>),
+    MissingArgument(String),
+    InvalidArgument(String, String),
 }
 
 impl Error for LotteryError {
-    fn description(&self) -> &str {
+    fn description<'a>(&'a self) -> &'a str {
         match *self {
             LotteryError::NoEventAvailable => "No event available",
-            LotteryError::BadParameter(_, _) => "Bad parameter",
-            
+            LotteryError::TechnicalError(_) => "Technical error",
+            LotteryError::MissingArgument(_) => "Missing argument",
+            LotteryError::InvalidArgument(_, _) => "Invalid argument"
         }
     }
 
     fn cause(&self) -> Option<&Error> {
         match *self {
-            LotteryError::NoEventAvailable =>None,
-            LotteryError::BadParameter(_, _) => None,
+            LotteryError::NoEventAvailable => None,
+            LotteryError::TechnicalError(ref error) => Some(error.as_ref()),
+            LotteryError::MissingArgument(_) => None,
+            LotteryError::InvalidArgument(_, _) => None
         }
     }
 }
@@ -55,9 +63,23 @@ impl Error for LotteryError {
 impl Display for LotteryError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            LotteryError::NoEventAvailable => write!(f, "LotteryError -> No event available"),
-            LotteryError::BadParameter(_, ref error) => write!(f,"Bad parameter : {:?}", error)
+            LotteryError::NoEventAvailable => write!(f, "No event available"),
+            LotteryError::TechnicalError(ref error) => write!(f, "Technical error: {}", error.as_ref()),
+            LotteryError::MissingArgument(ref arg) => write!(f, "Missing argument {}", arg),
+            LotteryError::InvalidArgument(ref arg, ref reason) => write!(f, "Invalid argument {} reason : {}", arg, reason)
         }
+    }
+}
+
+impl From<LotteryError> for Response {
+    fn from(err: LotteryError) -> Response {
+        let status = match err {
+            LotteryError::NoEventAvailable => status::Gone,
+            LotteryError::TechnicalError(_) => status::InternalServerError,
+            LotteryError::MissingArgument(_) => status::BadRequest,
+            LotteryError::InvalidArgument(_, _) => status::BadRequest
+        };
+        json_response(status, format!("{}", err))
     }
 }
 
@@ -104,24 +126,24 @@ fn https_client() -> hyper::Client {
     Client::with_connector(connector)
 }
 
-fn fetch(url: &str) -> Result<hyper::client::Response, Box<Error>> {
+fn fetch(url: &str) -> Result<hyper::client::Response, LotteryError> {
     https_client().get(url)
             .header(Connection::close())
             .send()
-            .map_err(|err| From::from(err))
+            .map_err(|err| LotteryError::TechnicalError(Box::from(err)))
 }
 
-fn json<T: rustc_serialize::Decodable>(mut resp: hyper::client::Response) -> Result<T, Box<Error>> {
+fn json<T: rustc_serialize::Decodable>(mut resp: hyper::client::Response) -> Result<T, LotteryError> {
     let mut body = String::new();
     resp.read_to_string(&mut body).unwrap();
     json::decode(&body)
-        .map_err(|err| From::from(err))
+        .map_err(|err| LotteryError::TechnicalError(Box::from(err)))
 }
 
-fn get_current_event (organizer: &str, token: &str) -> Result<Event, Box<Error>> {
+fn get_current_event (organizer: &str, token: &str) -> Result<Event, LotteryError> {
     fetch(&format!("https://www.eventbriteapi.com/v3/events/search/?sort_by=date&organizer.id={organizer}&token={token}", organizer=organizer, token=token))
         .and_then(json)
-        .and_then(|result: Events| result.events.first().map(|reference| reference.clone()).ok_or(Box::from(LotteryError::NoEventAvailable)))
+        .and_then(|result: Events| result.events.first().map(|reference| reference.clone()).ok_or(LotteryError::NoEventAvailable))
 }
 
 fn attendees_url(event_id: &str, token: &str, page: u8) -> String {
@@ -134,7 +156,7 @@ fn concat<T: Clone>(first: &Vec<T>, second: &Vec<T>) -> Vec<T> {
     result
 }
 
-fn get_attendees(event_id: &str, token: &str) -> Result<Vec<Profile>, Box<Error>> {
+fn get_attendees(event_id: &str, token: &str) -> Result<Vec<Profile>, LotteryError> {
     fetch(&attendees_url(event_id, token, 1))
         .and_then(json)
         .map(|result: Attendees| {
@@ -145,6 +167,7 @@ fn get_attendees(event_id: &str, token: &str) -> Result<Vec<Profile>, Box<Error>
                 })
             })
         .map(|attendees: Vec<Attende>| attendees.into_iter().map(|attendee| attendee.profile).collect())
+        .map_err(|err| LotteryError::TechnicalError(Box::from(err)))
 }
 
 fn json_response<T: rustc_serialize::Encodable> (status: iron::status::Status, body: T) -> Response {
@@ -153,10 +176,9 @@ fn json_response<T: rustc_serialize::Encodable> (status: iron::status::Status, b
 
 fn get_nb_winners(req: &mut Request) -> Result<u8, LotteryError> {
     req.get_ref::<UrlEncodedQuery>()
-        .map_err(|_| LotteryError::BadParameter(status::InternalServerError, String::from("Error parsing parameter's request")))
-        .and_then(|params| params.get("nb").ok_or(LotteryError::BadParameter(status::BadRequest, String::from("No parameter nb in request"))))
-        .and_then(|params| params.first().ok_or(LotteryError::BadParameter(status::BadRequest, String::from("No parameter nb in request"))))
-        .and_then(|value| value.parse::<u8>().map_err(|_| LotteryError::BadParameter(status::BadRequest, String::from("Parameter nb should be a positive integer"))))
+        .map_err(|err| LotteryError::TechnicalError(Box::from(err)))
+        .and_then(|params| params.get("nb").and_then(|args| args.first()).ok_or(LotteryError::MissingArgument(String::from("nb"))))
+        .and_then(|value| value.parse::<u8>().map_err(|_| LotteryError::InvalidArgument(String::from("nb"), String::from("Parameter nb should be a positive integer"))))
         .map_err(|err| From::from(err))
 }
 
@@ -164,10 +186,12 @@ fn winners(req: &mut Request) -> IronResult<Response> {
     unsafe {
         let mut rng = thread_rng();
         match get_nb_winners(req)
-                .and_then(|nb| CACHE.clone().map(|attendees| sample(&mut rng, attendees, nb as usize)).ok_or(LotteryError::BadParameter(status::BadRequest, String::from("No event retrieved from eventbrite")))) {
+                .and_then(|nb| CACHE.clone().map(|attendees| sample(&mut rng, attendees, nb as usize)).ok_or(LotteryError::NoEventAvailable)) {
             Ok(result) => Ok(json_response(status::Ok, result)),
-            Err(LotteryError::BadParameter(status, message)) => Ok(json_response(status, format!("Error while processing request :  {}", message))),
-            Err(LotteryError::NoEventAvailable) => Ok(Response::with((status::Ok, vec!())))
+            Err(error) => {
+                error!("Error during request execution => {}", error);
+                Ok(From::from(error))
+            }
         }
     }
 }
@@ -175,24 +199,26 @@ fn winners(req: &mut Request) -> IronResult<Response> {
 unsafe fn cache_loop(attendees: &mut Option<Vec<Profile>>, organizer: &str, token: &str, timeout: u64) {
     loop {
         println!("Fetch last event and attendees from eventbrite");
+        
         match get_current_event(organizer, token).and_then(|event| get_attendees(&event.id, token)) {
             Ok(current_attendees) => {mem::replace(attendees, Some(current_attendees));},
             Err(_err) => {mem::replace(attendees, None);}
         }
+        
+        /*
+        match get_attendees("34166417675", token) {
+            Ok(current_attendees) => {mem::replace(attendees, Some(current_attendees));},
+            Err(err) => println!("Error while fetching attendees {}", err)
+        }
+        */
         thread::sleep(time::Duration::from_secs(timeout));
     }
-        
-    /*
-    match get_attendees("34166417675", token) {
-        Ok(current_attendees) => {mem::replace(attendees, Some(current_attendees));},
-        Err(err) => println!("Error while fetching attendees {}", err)
-    }
-    */
 }
 
 static mut CACHE: Option<Vec<Profile>> = None;
 
 fn main() {
+    env_logger::init().unwrap();
     let organizer = env::var("ORGANIZER_TOKEN").unwrap();
     let token = env::var("EVENTBRITE_TOKEN").unwrap();
 
