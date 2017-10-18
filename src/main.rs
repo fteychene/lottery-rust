@@ -23,7 +23,7 @@ use rand::{thread_rng, sample};
 
 use iron::prelude::*;
 use iron::status;
-use hyper::header::{Connection, ContentType};
+use hyper::header::{Connection, ContentType, AccessControlAllowOrigin};
 #[allow(unused_imports)] use hyper::mime::*; // Import macro mine!
 use iron::modifiers::Header;
 use router::Router;
@@ -171,7 +171,10 @@ fn get_attendees(event_id: &str, token: &str) -> Result<Vec<Profile>, LotteryErr
 }
 
 fn json_response<T: rustc_serialize::Encodable> (status: iron::status::Status, body: T) -> Response {
-    Response::with((status, json::encode(&body).unwrap(), Header(ContentType(mime!(Application/Json; Charset=Utf8)))))
+    let mut response = Response::with((status, json::encode(&body).unwrap(), Header(ContentType(mime!(Application/Json; Charset=Utf8)))));
+    response.headers.set(AccessControlAllowOrigin::Any);
+    response
+
 }
 
 fn get_nb_winners(req: &mut Request) -> Result<u8, LotteryError> {
