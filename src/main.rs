@@ -1,4 +1,3 @@
-#![feature(drop_types_in_const)]
 #![feature(box_patterns)]
 extern crate hyper;
 extern crate hyper_native_tls;
